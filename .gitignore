@@ -1,0 +1,5 @@
+# Downloaded by build-windows.ps1
+cef_binary_*/
+*.tar.bz2
+# Build output
+out/

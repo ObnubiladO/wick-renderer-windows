@@ -1,0 +1,241 @@
+diff --git a/rust/src/analytics.rs b/rust/src/analytics.rs
+index 8cc2665..0cfd603 100644
+--- a/rust/src/analytics.rs
++++ b/rust/src/analytics.rs
+@@ -20,7 +20,8 @@
+ //!     point), machine IDs.
+ //!
+ //! Opt out by setting `WICK_TELEMETRY=0` or creating `<wick-home>/no-telemetry`.
+-//! `wick-home` is `$HOME/.wick` if `HOME` is set, otherwise `/tmp/.wick`.
++//! `wick-home` is `$HOME/.wick` if `HOME` is set (on Windows it falls back to
++//! `%USERPROFILE%\.wick`), otherwise `/tmp/.wick`.
+ //!
+ //! Implementation notes: a single background worker thread drains a bounded
+ //! channel of pending events. Reusing one `reqwest::blocking::Client` and
+@@ -222,12 +223,26 @@ pub fn is_opted_out() -> bool {
+     wick_home().join("no-telemetry").exists()
+ }
+ 
+-/// Resolve `<HOME>/.wick`, falling back to `/tmp/.wick` if `HOME` is unset.
++/// The user's home directory. `HOME` wins on every platform, so wrappers and
++/// tests can redirect wick's state. Windows normally leaves `HOME` unset and
++/// falls back to `USERPROFILE`; without that, every `~/.wick` lookup missed
++/// and state landed in `\tmp\.wick` on the current drive.
++pub(crate) fn home_dir() -> Option<PathBuf> {
++    fn non_empty(name: &str) -> Option<PathBuf> {
++        std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
++    }
++    non_empty("HOME").or_else(|| if cfg!(windows) { non_empty("USERPROFILE") } else { None })
++}
++
++/// Resolve `<home>/.wick` (see [`home_dir`]), falling back to `/tmp/.wick`
++/// (the system temp directory on Windows) when no home directory is known.
+ /// Used by all on-disk wick state (telemetry markers, opt-out flag, etc.)
+ /// so behavior is consistent across env configurations.
+ pub(crate) fn wick_home() -> PathBuf {
+-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+-    PathBuf::from(home).join(".wick")
++    let home = home_dir().unwrap_or_else(|| {
++        if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") }
++    });
++    home.join(".wick")
+ }
+ 
+ fn ping_marker(event: &str) -> PathBuf {
+diff --git a/rust/src/captcha.rs b/rust/src/captcha.rs
+index 964e3ef..7fe6ea6 100644
+--- a/rust/src/captcha.rs
++++ b/rust/src/captcha.rs
+@@ -98,8 +98,8 @@ fn find_solver() -> Result<PathBuf> {
+         std::env::current_exe()
+             .ok()
+             .and_then(|p| p.parent().map(|d| d.join("wick-captcha"))),
+-        std::env::var_os("HOME")
+-            .map(|h| PathBuf::from(h).join(".wick").join("bin").join("wick-captcha")),
++        crate::analytics::home_dir()
++            .map(|h| h.join(".wick").join("bin").join("wick-captcha")),
+     ];
+ 
+     for loc in locations.iter().flatten() {
+diff --git a/rust/src/captcha_auto.rs b/rust/src/captcha_auto.rs
+index 0a75efb..610fc0a 100644
+--- a/rust/src/captcha_auto.rs
++++ b/rust/src/captcha_auto.rs
+@@ -85,8 +85,8 @@ pub fn load_capsolver_key() -> Option<String> {
+             return Some(key);
+         }
+     }
+-    let home = std::env::var_os("HOME")?;
+-    let path = std::path::PathBuf::from(home).join(".wick").join("capsolver-key");
++    let home = crate::analytics::home_dir()?;
++    let path = home.join(".wick").join("capsolver-key");
+     std::fs::read_to_string(&path)
+         .ok()
+         .map(|s| s.trim().to_string())
+diff --git a/rust/src/cef.rs b/rust/src/cef.rs
+index 35e5825..cc1960b 100644
+--- a/rust/src/cef.rs
++++ b/rust/src/cef.rs
+@@ -141,6 +141,22 @@ fn ensure_daemon(use_residential: bool) -> Result<()> {
+         .stdout(Stdio::piped())
+         .stderr(Stdio::inherit());
+ 
++    // Windows: the renderer is a console program. Without this flag it opens
++    // a console window of its own whenever wick itself runs without one
++    // (started by a GUI host or a service).
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++        cmd.creation_flags(CREATE_NO_WINDOW);
++        // `--proxy` is not exported to the environment (see main.rs), so hand
++        // the resolved proxy to the renderer explicitly; it forwards it to
++        // Chromium as --proxy-server.
++        if let Some(proxy) = crate::fetch::effective_proxy() {
++            cmd.env("WICK_PROXY", proxy);
++        }
++    }
++
+     // Xvfb for Linux WebGL
+     #[cfg(target_os = "linux")]
+     if std::env::var("DISPLAY").is_err() {
+@@ -224,6 +240,9 @@ pub fn is_available() -> bool {
+ }
+ 
+ fn find_renderer() -> Result<PathBuf> {
++    // `wick-renderer` on Unix, `wick-renderer.exe` on Windows.
++    let renderer = format!("wick-renderer{}", std::env::consts::EXE_SUFFIX);
++    let home = crate::analytics::home_dir();
+     let locations = [
+         std::env::current_exe().ok().and_then(|p| {
+             p.parent()
+@@ -231,14 +250,12 @@ fn find_renderer() -> Result<PathBuf> {
+         }),
+         std::env::current_exe()
+             .ok()
+-            .and_then(|p| p.parent().map(|d| d.join("wick-renderer"))),
++            .and_then(|p| p.parent().map(|d| d.join(&renderer))),
+         Some(PathBuf::from("/opt/wick/wick-renderer")),
+-        std::env::var_os("HOME").map(|h| {
+-            PathBuf::from(h).join(".wick").join("cef").join("wick-renderer")
+-        }),
+-        std::env::var_os("HOME").map(|h| {
+-            PathBuf::from(h)
+-                .join(".wick")
++        home.as_ref()
++            .map(|h| h.join(".wick").join("cef").join(&renderer)),
++        home.as_ref().map(|h| {
++            h.join(".wick")
+                 .join("cef")
+                 .join("wick-renderer.app/Contents/MacOS/wick-renderer")
+         }),
+diff --git a/rust/src/engine.rs b/rust/src/engine.rs
+index caebb45..8d88097 100644
+--- a/rust/src/engine.rs
++++ b/rust/src/engine.rs
+@@ -98,9 +98,9 @@ pub struct RawResponse {
+ }
+ 
+ fn storage_path() -> Result<PathBuf> {
+-    let home = std::env::var_os("HOME")
++    let home = crate::analytics::home_dir()
+         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+-    Ok(PathBuf::from(home).join(".wick").join("data"))
++    Ok(home.join(".wick").join("data"))
+ }
+ 
+ pub fn chrome_user_agent() -> String {
+diff --git a/rust/src/fetch.rs b/rust/src/fetch.rs
+index 058fc34..d76bab0 100644
+--- a/rust/src/fetch.rs
++++ b/rust/src/fetch.rs
+@@ -866,6 +866,18 @@ pub fn set_proxy(proxy: Option<&str>) {
+     let _ = EFFECTIVE_PROXY.set(proxy.map(|s| s.to_string()));
+ }
+ 
++/// The proxy recorded by [`set_proxy`], if any. The Windows CEF renderer is
++/// started with it so rendered pages leave through the same route as every
++/// other fetch instead of going around a configured proxy.
++#[cfg(windows)]
++pub(crate) fn effective_proxy() -> Option<String> {
++    EFFECTIVE_PROXY
++        .get()
++        .and_then(|p| p.clone())
++        .map(|p| p.trim().to_string())
++        .filter(|p| !p.is_empty())
++}
++
+ /// True when the error is *definitively* the user's own network being gone —
+ /// the OS told Cronet so. These never need the connectivity probe and must
+ /// never be attributed to the site.
+diff --git a/rust/src/pro.rs b/rust/src/pro.rs
+index 69f3ed4..f2a9b89 100644
+--- a/rust/src/pro.rs
++++ b/rust/src/pro.rs
+@@ -47,6 +47,42 @@ pub async fn activate(_legacy_key: Option<String>) -> Result<()> {
+         println!("  curl -fsSL {} | sudo WICK_VERSION={} -E bash", script_url, version);
+     }
+ 
++    #[cfg(target_os = "windows")]
++    {
++        // The Windows renderer is compiled locally with MSVC by
++        // scripts/install-cef-windows.ps1. Run the script when it sits next
++        // to this binary or WICK_CEF_INSTALLER names it; otherwise explain
++        // how to run it from a checkout (it needs the rust/cef sources).
++        let script = std::env::var_os("WICK_CEF_INSTALLER")
++            .map(std::path::PathBuf::from)
++            .or_else(|| {
++                std::env::current_exe()
++                    .ok()
++                    .and_then(|p| p.parent().map(|d| d.join("install-cef-windows.ps1")))
++            })
++            .filter(|p| p.exists());
++        match script {
++            Some(script) => {
++                let status = std::process::Command::new("powershell.exe")
++                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
++                    .arg(&script)
++                    .status()?;
++                if !status.success() {
++                    println!("Auto-install failed. Run manually:");
++                    println!(
++                        "  powershell -ExecutionPolicy Bypass -File \"{}\"",
++                        script.display()
++                    );
++                }
++            }
++            None => {
++                println!("Run this from a wick checkout (wick {}) to build and install it:", ref_name);
++                println!("  powershell -ExecutionPolicy Bypass -File scripts\\install-cef-windows.ps1");
++                println!("It needs Visual Studio 2022 Build Tools with the C++ workload.");
++            }
++        }
++    }
++
+     Ok(())
+ }
+ 
+diff --git a/rust/src/session.rs b/rust/src/session.rs
+index 2077ef0..5b041f3 100644
+--- a/rust/src/session.rs
++++ b/rust/src/session.rs
+@@ -16,5 +16,5 @@ pub fn clear() -> Result<()> {
+ }
+ 
+ fn dirs_next() -> Option<PathBuf> {
+-    std::env::var_os("HOME").map(PathBuf::from)
++    crate::analytics::home_dir()
+ }
+diff --git a/rust/src/setup.rs b/rust/src/setup.rs
+index 28f6dd4..58d9649 100644
+--- a/rust/src/setup.rs
++++ b/rust/src/setup.rs
+@@ -203,7 +203,6 @@ fn setup_cursor(wick_path: &str) -> Result<()> {
+ }
+ 
+ fn home_dir() -> Result<PathBuf> {
+-    std::env::var_os("HOME")
+-        .map(PathBuf::from)
++    crate::analytics::home_dir()
+         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))
+ }
