@@ -47,11 +47,12 @@ language packs you name).
 ## Use with Wick
 
 1. **Wick needs a small change to use a renderer on Windows.** Unpatched, it
-   looks for `wick-renderer` without `.exe`, only under `HOME`, which
-   Windows does not set, and it would open a console window for it.
-   `patches/wick-windows.patch` fixes that, against Wick commit `a867821`
-   (version 0.12.0). It also makes Wick keep its state in `%USERPROFILE%`
-   when `HOME` is unset, and passes Wick's `--proxy` on to the renderer.
+   looks for a file named `wick-renderer` (no `.exe`), and it finds its home
+   directory only through `HOME`, which Windows does not set. It would also
+   open a console window for the renderer. `patches/wick-windows.patch`
+   fixes that (99 lines added, 20 removed), against Wick commit `a867821`
+   (version 0.12.0). With it, Wick also keeps its state in `%USERPROFILE%`
+   when `HOME` is unset, and passes its `--proxy` on to the renderer.
 
    ```powershell
    git clone https://github.com/wickproject/wick
@@ -78,6 +79,12 @@ language packs you name).
 
 If a per-application firewall is running, it will ask about
 `wick-helper.exe`. That is Chromium's network process, which loads the pages.
+
+On Windows the renderer is the only part of Wick that is Chrome. Wick's
+macOS and Linux builds make their plain requests with Chromium's network
+stack (Cronet). Wick has no Cronet build for Windows, so there it falls back
+to an ordinary HTTP client that sends Chrome's headers, which its own source
+calls detectable.
 
 ## Protocol
 
@@ -126,7 +133,8 @@ wick-renderer.exe
 | `WICK_CEF_STEALTH=1` | Run Wick's fingerprint script (`stealth.h`), repaired. Off by default (see below). |
 | `WICK_CEF_KEEP_ELEVATION=1` | Keep administrator rights when started from an elevated process. |
 
-The renderer itself sends no telemetry.
+The renderer has no telemetry of its own. For the requests Chromium makes by
+itself, see "Fewer calls home" below.
 
 ## What a page can and cannot do
 
@@ -147,7 +155,7 @@ it refuses everything that reaches outside it:
 | reach a service on this machine from a public address | refused |
 | send direct UDP packets (WebRTC), the way a site sees past a proxy | none are sent |
 | open a file picker | cancelled |
-| play sound | muted |
+| play sound | Chromium runs with `--mute-audio` |
 | close the browser (`window.close()`) | ignored |
 | keep running after its HTML was returned (timers, requests, wake locks) | the browser it ran in is closed |
 | be loaded from `file:`, `chrome:` or any scheme but `http`/`https` | not rendered |
@@ -203,7 +211,8 @@ would otherwise stay on the desktop until someone closed it.
 ## License
 
 MIT; see [LICENSE](LICENSE). Parts come from Wick, which is published under
-the MIT License.
+the MIT License: its README and `Cargo.toml` say so, though its repository
+has no licence file of its own.
 
 CEF is BSD-licensed. It is downloaded at build time and is not part of this
 repository. The build copies CEF's `LICENSE.txt` into the output as
